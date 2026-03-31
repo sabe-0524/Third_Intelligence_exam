@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/codex-worktree.sh <branch-name> [-- <codex-args...>]
+
+Behavior:
+  - Creates a git worktree under $HOME/.codex/worktrees by default.
+  - The worktree directory name is derived from the branch name.
+  - Launches codex with --ask-for-approval never and --cd <worktree-path>.
+
+Environment:
+  CODEX_WORKTREE_ROOT  Destination root for created worktrees
+                       (default: $HOME/.codex/worktrees)
+
+Examples:
+  scripts/codex-worktree.sh feat/setup-codex-worktree
+  scripts/codex-worktree.sh feat/setup-codex-worktree -- exec
+EOF
+}
+
+require_command() {
+  local command_name="$1"
+
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "error: '$command_name' is required but was not found." >&2
+    exit 1
+  fi
+}
+
+slugify() {
+  local value="$1"
+
+  value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  value="$(printf '%s' "$value" | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//; s/-{2,}/-/g')"
+
+  printf '%s' "$value"
+}
+
+resolve_default_base_ref() {
+  local repo_root="$1"
+  local current_branch
+
+  current_branch="$(git -C "$repo_root" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [[ -n "$current_branch" ]]; then
+    printf '%s\n' "$current_branch"
+    return
+  fi
+
+  local origin_head
+
+  origin_head="$(git -C "$repo_root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [[ -n "$origin_head" ]]; then
+    printf '%s\n' "$origin_head"
+    return
+  fi
+
+  if git -C "$repo_root" show-ref --verify --quiet refs/heads/main; then
+    printf 'main\n'
+    return
+  fi
+
+  if git -C "$repo_root" show-ref --verify --quiet refs/heads/master; then
+    printf 'master\n'
+    return
+  fi
+
+  git -C "$repo_root" rev-parse --short HEAD
+}
+
+require_command git
+require_command codex
+
+if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "${1:-}" == "" ]]; then
+  usage
+  exit 1
+fi
+
+branch_name="$1"
+shift
+
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(git -C "${script_dir}/.." rev-parse --show-toplevel)"
+base_ref="$(resolve_default_base_ref "$repo_root")"
+worktree_name="$(slugify "${branch_name#codex/}")"
+
+if [[ -z "$worktree_name" ]]; then
+  echo "error: failed to derive a safe worktree identifier from branch '${branch_name}'." >&2
+  exit 1
+fi
+
+if ! git -C "$repo_root" rev-parse --verify --quiet "${base_ref}^{commit}" >/dev/null; then
+  echo "error: base ref not found: ${base_ref}" >&2
+  exit 1
+fi
+
+if git -C "$repo_root" worktree list --porcelain | awk '/^branch / {print $2}' | grep -Fxq "refs/heads/${branch_name}"; then
+  echo "error: branch is already checked out in another worktree: ${branch_name}" >&2
+  exit 1
+fi
+
+worktree_root="${CODEX_WORKTREE_ROOT:-$HOME/.codex/worktrees}"
+mkdir -p "$worktree_root"
+
+session_dir="$(mktemp -d "${worktree_root%/}/${worktree_name}-XXXXXX")"
+session_dir="$(cd "$session_dir" && pwd -P)"
+repo_name="$(basename "$repo_root")"
+target_worktree_path="${session_dir}/${repo_name}"
+
+cd "$repo_root"
+
+if git show-ref --verify --quiet "refs/heads/${branch_name}"; then
+  git worktree add "$target_worktree_path" "$branch_name"
+else
+  git worktree add -b "$branch_name" "$target_worktree_path" "$base_ref"
+fi
+
+echo "worktree: ${target_worktree_path}"
+echo "branch: ${branch_name}"
+echo "base: ${base_ref}"
+
+exec codex --ask-for-approval never --cd "$target_worktree_path" "$@"
